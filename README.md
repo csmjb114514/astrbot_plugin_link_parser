@@ -1,6 +1,8 @@
 # astrbot_plugin_link_parser
 基于AstrBot平台的Python插件，可以进行绕过忍者链接进行解析，需要购买Lat bypass服务
 
+AstrBot文档地址：https://docs.astrbot.app/
+
 链接解析插件文档
 
 📝 插件信息
