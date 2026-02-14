@@ -1,17 +1,23 @@
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger, AstrBotConfig
-from astrbot.api.message_components import Plain, At, Reply
-from astrbot.api.event import MessageChain
-import aiohttp
+"""
+链接解析插件 - 支持任务排队和自动重试
+"""
+
+import asyncio
 import json
 import re
-import asyncio
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
-from urllib.parse import urlparse, urlencode
 import time
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
+
+import aiohttp
+
+from astrbot.api import logger, AstrBotConfig
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Plain, At, Reply
+from astrbot.api.star import Context, Star, register
+
 
 class TaskStatus(Enum):
     """任务状态枚举"""
@@ -22,19 +28,502 @@ class TaskStatus(Enum):
     CANCELLED = "cancelled"
     TIMEOUT = "timeout"
 
+
 @dataclass
 class ParseTask:
-    """解析任务类"""
+    """解析任务数据类"""
+    # 用户信息
     user_id: str
     user_name: str
     url: str
     event_origin: str
+    
+    # 消息信息
     message_id: Optional[str] = None
+    
+    # 任务状态
     attempts: int = 0
     max_attempts: int = 10
     status: TaskStatus = TaskStatus.PENDING
-    create_time: float = None
-    last_attempt_time: float = None
+    
+    # 时间信息
+    create_time: float = field(default_factory=time.time)
+    last_attempt_time: Optional[float] = None
+    
+    # 错误记录
+    error_history: List[str] = field(default_factory=list)
+    
+    def is_active(self) -> bool:
+        """判断任务是否处于活跃状态"""
+        return self.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)
+
+
+@register("link_parser", "传送门", "链接解析插件，支持解卡功能和任务排队", "1.2.0")
+class LinkParserPlugin(Star):
+    """链接解析插件主类"""
+    
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        
+        # 从配置读取（必须配置，无默认值）
+        self.api_key = config.get("api_key", "")
+        self.api_url = config.get("api_url", "")
+        self.debug_mode = config.get("debug_mode", False)
+        self.max_attempts = config.get("max_attempts", 10)
+        self.task_interval = config.get("task_interval", 30)
+        self.max_queue_size = config.get("max_queue_size", 10)
+        self.task_timeout = config.get("task_timeout", 1800)
+        
+        # 允许的域名列表（纯域名，不带协议）
+        self.allowed_domains = config.get("allowed_domains", [
+            "auth.platoboost.com",
+            "auth.platorelay.com",
+            "auth.platoboost.net",
+            "auth.platoboost.click",
+            "auth.platoboost.app",
+            "auth.platoboost.me",
+            "deltaios-executor.com"
+        ])
+        
+        # 验证必要配置
+        if not self.api_key or not self.api_url:
+            logger.error("请先在配置中设置 api_key 和 api_url")
+        
+        # 任务队列
+        self.task_queue: asyncio.Queue = asyncio.Queue()
+        self.current_task: Optional[ParseTask] = None
+        self.processing_lock = asyncio.Lock()
+        self.user_tasks: Dict[str, List[ParseTask]] = {}
+        self.last_process_time = 0.0
+        
+        # 后台任务控制
+        self._running = True
+        self._processor_task: Optional[asyncio.Task] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        
+        # 启动后台任务
+        self._init_background_tasks()
+        
+        if self.debug_mode:
+            logger.info("链接解析插件初始化完成")
+    
+    def _init_background_tasks(self):
+        """初始化后台任务"""
+        self._session = aiohttp.ClientSession()
+        self._processor_task = asyncio.create_task(self._process_task_queue())
+    
+    def _get_masked_key(self) -> str:
+        """获取脱敏后的API key"""
+        key = self.api_key
+        if len(key) <= 8:
+            return "****"
+        return key[:4] + "****" + key[-4:]
+    
+    def _is_allowed_domain(self, url: str) -> bool:
+        """严格验证域名是否在允许列表中"""
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ""
+            
+            # 移除 www. 前缀
+            if hostname.startswith('www.'):
+                hostname = hostname[4:]
+            
+            # 检查是否在允许列表中（支持子域名）
+            for domain in self.allowed_domains:
+                if hostname == domain or hostname.endswith('.' + domain):
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    async def _make_request(self, url: str) -> dict:
+        """发送HTTP请求"""
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+        
+        try:
+            params = {
+                'url': url,
+                'api_key': self.api_key
+            }
+            
+            if self.debug_mode:
+                masked_key = self._get_masked_key()
+                logger.info(f"请求API: {self.api_url}, url={url}, api_key={masked_key}")
+            
+            async with self._session.get(self.api_url, params=params, timeout=30) as resp:
+                status = resp.status
+                text = await resp.text()
+                
+                if self.debug_mode:
+                    logger.info(f"API响应: 状态码={status}, 内容长度={len(text)}")
+                
+                if status != 200:
+                    return {
+                        "success": False,
+                        "message": f"API请求失败，状态码: {status}"
+                    }
+                
+                return self._parse_response(text)
+                
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "请求超时"}
+        except aiohttp.ClientError as e:
+            return {"success": False, "message": f"网络请求错误: {str(e)}"}
+        except Exception as e:
+            return {"success": False, "message": f"解析过程出错: {str(e)}"}
+    
+    def _parse_response(self, text: str) -> dict:
+        """解析API响应"""
+        # 错误类型判断
+        error_patterns = [
+            ("API Offline", "API服务暂时不可用"),
+            ("短时间内已经请求过同一链接", "请勿频繁请求同一链接"),
+            ("Invalid Delta Link", "无效的忍者链接，请重新获取"),
+            ("该链接为过期链接", "链接已过期，请重新获取"),
+        ]
+        
+        for pattern, message in error_patterns:
+            if pattern in text:
+                return {"success": False, "message": message}
+        
+        # 成功判断
+        if self._is_success_response(text):
+            card_key = self._extract_value(text, "key")
+            time_taken = self._extract_value(text, "time")
+            
+            return {
+                "success": True,
+                "message": (
+                    f"✅ 解卡成功！\n"
+                    f"🔑 卡密：{card_key}\n"
+                    f"⏱️ 耗时：{time_taken}\n"
+                    f"🎮 祝你游玩愉快"
+                )
+            }
+        
+        return {"success": False, "message": "未知的响应类型"}
+    
+    def _is_success_response(self, text: str) -> bool:
+        """判断是否为成功响应"""
+        # 检查status字段
+        if '"status":"success"' in text.lower() or "'status':'success'" in text.lower():
+            return True
+        
+        # 检查key和time字段
+        has_key = re.search(r'"key"\s*:\s*"([^"]+)"', text, re.IGNORECASE) is not None
+        has_time = re.search(r'"time"\s*:\s*"([^"]+)"', text, re.IGNORECASE) is not None
+        
+        return has_key and has_time
+    
+    def _extract_value(self, text: str, key: str) -> str:
+        """提取字段值"""
+        try:
+            data = json.loads(text)
+            return str(data.get(key, "未知"))
+        except json.JSONDecodeError:
+            patterns = [
+                f'"{key}"\\s*:\\s*"([^"]+)"',
+                f"'{key}'\\s*:\\s*'([^']+)'",
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+            
+            return "未知"
+    
+    def _calculate_wait_time(self, result: dict, task: ParseTask) -> int:
+        """计算等待时间"""
+        message = result.get("message", "")
+        
+        if "API服务暂时不可用" in message:
+            return 60
+        if "请勿频繁请求" in message:
+            return 120
+        if "请求超时" in message or "网络请求错误" in message:
+            return 45
+        
+        # 默认等待时间，随尝试次数增加
+        base = self.task_interval
+        return base * 2 if task.attempts > 5 else base
+    
+    async def _send_message(self, event_origin: str, task: ParseTask, content: str, reply: bool = True):
+        """发送消息（统一入口）"""
+        try:
+            chain = []
+            
+            # 引用原消息
+            if reply and task.message_id:
+                chain.append(Reply(id=task.message_id))
+            
+            # @用户
+            chain.append(At(qq=str(task.user_id)))
+            
+            # 消息内容
+            chain.append(Plain("\n" + content))
+            
+            await self.context.send_message(event_origin, MessageChain(chain))
+            
+        except Exception as e:
+            logger.error(f"发送消息失败: {str(e)}")
+    
+    @filter.command("解卡")
+    async def cmd_parse(self, event: AstrMessageEvent, url: str):
+        """解析链接命令"""
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+        
+        # 检查配置
+        if not self.api_key or not self.api_url:
+            yield event.plain_result("❌ 插件未配置，请联系管理员")
+            return
+        
+        # 格式化URL
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        # 验证域名
+        if not self._is_allowed_domain(url):
+            domains = "\n".join(self.allowed_domains)
+            yield event.plain_result(f"❌ 不支持的域名\n支持的域名：\n{domains}")
+            return
+        
+        # 检查队列
+        if self.task_queue.qsize() >= self.max_queue_size:
+            yield event.plain_result(f"⚠️ 队列已满，请稍后再试")
+            return
+        
+        # 清理旧任务
+        if user_id in self.user_tasks:
+            active = [t for t in self.user_tasks[user_id] if t.is_active()]
+            completed = [t for t in self.user_tasks[user_id] if not t.is_active()][-5:]
+            self.user_tasks[user_id] = active + completed
+            
+            if len(active) >= 2:
+                yield event.plain_result("⚠️ 你已有任务在排队中")
+                return
+        
+        # 创建任务
+        task = ParseTask(
+            user_id=user_id,
+            user_name=user_name,
+            url=url,
+            event_origin=event.unified_msg_origin,
+            message_id=event.message_obj.message_id,
+            max_attempts=self.max_attempts
+        )
+        
+        # 排队位置
+        position = self.task_queue.qsize() + 1
+        
+        # 加入队列
+        await self.task_queue.put(task)
+        
+        # 记录任务
+        if user_id not in self.user_tasks:
+            self.user_tasks[user_id] = []
+        self.user_tasks[user_id].append(task)
+        
+        # 响应
+        wait_time = position * self.task_interval
+        yield event.plain_result(
+            f"✅ 已加入队列\n"
+            f"📊 位置：第{position}位\n"
+            f"⏱️ 预计等待：约{wait_time}秒\n"
+            f"🔄 最多尝试：{self.max_attempts}次"
+        )
+        
+        if self.debug_mode:
+            logger.info(f"用户 {user_name} 添加任务，位置 {position}")
+    
+    async def _process_task_queue(self):
+        """处理任务队列"""
+        while self._running:
+            try:
+                task = await self.task_queue.get()
+                
+                # 跳过已取消的任务
+                if task.status == TaskStatus.CANCELLED:
+                    self.task_queue.task_done()
+                    continue
+                
+                # 任务间隔
+                now = time.time()
+                if self.last_process_time > 0:
+                    elapsed = now - self.last_process_time
+                    if elapsed < self.task_interval:
+                        await asyncio.sleep(self.task_interval - elapsed)
+                
+                # 处理任务
+                async with self.processing_lock:
+                    self.current_task = task
+                    task.status = TaskStatus.PROCESSING
+                    
+                    if self.debug_mode:
+                        logger.info(f"处理任务: {task.url}")
+                    
+                    success = await self._execute_task(task)
+                    
+                    if task.status != TaskStatus.CANCELLED:
+                        task.status = TaskStatus.SUCCESS if success else TaskStatus.FAILED
+                    
+                    self.last_process_time = time.time()
+                    self.current_task = None
+                
+                self.task_queue.task_done()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"队列处理错误: {str(e)}")
+                await asyncio.sleep(5)
+    
+    async def _execute_task(self, task: ParseTask) -> bool:
+        """执行单个任务"""
+        consecutive_failures = 0
+        
+        while task.attempts < task.max_attempts and self._running:
+            # 检查取消
+            if task.status == TaskStatus.CANCELLED:
+                return False
+            
+            try:
+                task.attempts += 1
+                task.last_attempt_time = time.time()
+                
+                # 执行请求
+                result = await self._make_request(task.url)
+                
+                # 记录错误
+                if not result["success"]:
+                    task.error_history.append(f"第{task.attempts}次: {result['message']}")
+                    consecutive_failures += 1
+                
+                # 成功
+                if result["success"]:
+                    await self._send_message(task.event_origin, task, result["message"])
+                    return True
+                
+                # 超时检查
+                if time.time() - task.create_time > self.task_timeout:
+                    task.status = TaskStatus.TIMEOUT
+                    msg = f"⏰ 任务超时，已尝试{task.attempts}次"
+                    await self._send_message(task.event_origin, task, msg)
+                    return False
+                
+                # 连续失败提醒
+                if consecutive_failures >= 3 and task.attempts < task.max_attempts:
+                    msg = f"⚠️ 连续{consecutive_failures}次失败"
+                    await self._send_message(task.event_origin, task, msg, reply=False)
+                
+                # 计算等待时间
+                wait = self._calculate_wait_time(result, task)
+                
+                # 重试通知
+                if task.attempts < task.max_attempts:
+                    msg = (
+                        f"🔄 第{task.attempts}次失败\n"
+                        f"❌ {result['message']}\n"
+                        f"⏱️ {wait}秒后第{task.attempts + 1}次尝试\n"
+                        f"📊 {task.attempts}/{task.max_attempts}次"
+                    )
+                    await self._send_message(task.event_origin, task, msg, reply=False)
+                    await asyncio.sleep(wait)
+                else:
+                    # 最终失败
+                    history = "\n".join(task.error_history[-3:])
+                    msg = (
+                        f"❌ 失败{task.max_attempts}次\n"
+                        f"📝 最近错误：\n{history}\n"
+                        f"💡 建议重新获取链接"
+                    )
+                    await self._send_message(task.event_origin, task, msg)
+                    return False
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"任务执行错误: {str(e)}")
+                task.error_history.append(f"异常: {str(e)}")
+                
+                if task.attempts < task.max_attempts:
+                    await asyncio.sleep(self.task_interval)
+                else:
+                    return False
+        
+        return False
+    
+    @filter.command("队列状态")
+    async def cmd_status(self, event: AstrMessageEvent):
+        """查看队列状态"""
+        size = self.task_queue.qsize()
+        
+        msg = (
+            f"📊 队列状态\n"
+            f"等待数：{size}\n"
+            f"处理中：{'是' if self.current_task else '否'}\n"
+            f"间隔：{self.task_interval}秒\n"
+            f"最大尝试：{self.max_attempts}次"
+        )
+        
+        if self.current_task:
+            msg += f"\n当前：{self.current_task.url[:50]}..."
+            msg += f"\n已尝试：{self.current_task.attempts}次"
+        
+        yield event.plain_result(msg)
+    
+    @filter.command("取消任务")
+    async def cmd_cancel(self, event: AstrMessageEvent):
+        """取消用户任务"""
+        user_id = event.get_sender_id()
+        
+        if user_id not in self.user_tasks:
+            yield event.plain_result("❌ 没有任务")
+            return
+        
+        active = [t for t in self.user_tasks[user_id] if t.is_active()]
+        
+        if not active:
+            yield event.plain_result("❌ 没有活跃任务")
+            return
+        
+        count = 0
+        for task in active:
+            task.status = TaskStatus.CANCELLED
+            count += 1
+        
+        yield event.plain_result(f"✅ 已取消{count}个任务")
+    
+    async def terminate(self):
+        """插件卸载"""
+        logger.info("正在卸载插件...")
+        self._running = False
+        
+        # 取消后台任务
+        if self._processor_task:
+            self._processor_task.cancel()
+            try:
+                await self._processor_task
+            except asyncio.CancelledError:
+                pass
+        
+        # 关闭session
+        if self._session:
+            await self._session.close()
+        
+        # 清空队列
+        while not self.task_queue.empty():
+            try:
+                self.task_queue.get_nowait()
+                self.task_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        
+        logger.info("插件已卸载")    last_attempt_time: float = None
     error_history: List[str] = field(default_factory=list)
     
     def __post_init__(self):
