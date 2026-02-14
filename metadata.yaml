@@ -2,7 +2,7 @@ name: link_parser
 display_name: 忍者链接解析插件
 author: 传送门
 description: 链接解析插件，支持解卡功能
-version: 1.0.0
+version: 1.1.0
 repo_url: https://github.com/csmjb114514/astrbot_plugin_link_parser
 homepage: https://github.com/csmjb114514/astrbot_plugin_link_parser
 tags:
