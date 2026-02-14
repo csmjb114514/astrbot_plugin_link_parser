@@ -1,4 +1,4 @@
-name: link_parser
+name: astrbot_plugin_link_parser
 display_name: 忍者链接解析插件
 author: 传送门
 description: 链接解析插件，支持解卡功能
@@ -10,5 +10,7 @@ tags:
   - parser
   - 链接解析
   - 解卡
+  - Delta
+  - 罗布乐思
 dependencies:
   - aiohttp>=3.8.0
