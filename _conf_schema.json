@@ -1,0 +1,78 @@
+{
+  "api_key": {
+    "description": "API密钥",
+    "type": "string",
+    "hint": "请输入你的API密钥",
+    "obvious_hint": true,
+    "default": "User_LAT1234567890"
+  },
+  "api_url": {
+    "description": "API地址",
+    "type": "string",
+    "hint": "API请求地址",
+    "default": "https://api.bypass.ceo/bypass/qq-bot/delta/q-bot"
+  },
+  "debug_mode": {
+    "description": "调试模式",
+    "type": "bool",
+    "hint": "开启后将输出详细的调试日志",
+    "default": false
+  },
+  "max_retries": {
+    "description": "最大重试次数",
+    "type": "int",
+    "hint": "每个任务最多重试几次",
+    "default": 3,
+    "min": 1,
+    "max": 10
+  },
+  "max_total_attempts": {
+    "description": "最大总尝试次数",
+    "type": "int",
+    "hint": "每个任务最多尝试多少次（包括重试）",
+    "default": 10,
+    "min": 3,
+    "max": 30
+  },
+  "task_interval": {
+    "description": "任务间隔（秒）",
+    "type": "int",
+    "hint": "每个任务处理完成后等待多少秒再处理下一个",
+    "default": 30,
+    "min": 5,
+    "max": 120
+  },
+  "task_timeout": {
+    "description": "任务超时时间（秒）",
+    "type": "int",
+    "hint": "任务从创建到完成的最大时间，超过则自动放弃",
+    "default": 1800,
+    "min": 300,
+    "max": 7200
+  },
+  "max_queue_size": {
+    "description": "最大队列长度",
+    "type": "int",
+    "hint": "同时最多允许多少个任务排队",
+    "default": 10,
+    "min": 1,
+    "max": 50
+  },
+  "allowed_domains": {
+    "description": "允许的域名列表",
+    "type": "list",
+    "hint": "只允许这些域名的链接进行解析",
+    "default": [
+      "https://auth.platoboost.com",
+      "https://auth.platorelay.com",
+      "https://auth.platoboost.net",
+      "https://auth.platoboost.click",
+      "https://auth.platoboost.app",
+      "https://auth.platoboost.me",
+      "https://deltaios-executor.com"
+    ],
+    "items": {
+      "type": "string"
+    }
+  }
+}
